@@ -29,4 +29,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix nocgo -o /traefik-forwar
 FROM alpine
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /traefik-forward-auth ./
-ENTRYPOINT ["./traefik-forward-auth"]
+
+COPY scripts/wait-for-it.sh $WORKDIR/scripts/wait-for-it.sh
+
+RUN chmod a+x -R $WORKDIR/scripts
+
+# Verify keycloak is up first
+CMD $WORKDIR/scripts/wait-for-it.sh $KEYCLOAK_HOST_PORT -- ./traefik-forward-auth

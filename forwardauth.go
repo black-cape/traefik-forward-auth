@@ -40,6 +40,8 @@ type ForwardAuth struct {
 	Whitelist []string
 
 	Prompt string
+
+	tokenHeader string
 }
 
 // Request Validation
@@ -158,12 +160,11 @@ func (f *ForwardAuth) ExchangeCode(r *http.Request, code string) (string, error)
 }
 
 // Get user with token
-
 type User struct {
-	Id       string `json:"id"`
+	Id       string `json:"sub"`
 	Email    string `json:"email"`
-	Verified bool   `json:"verified_email"`
-	Hd       string `json:"hd"`
+	Verified bool   `json:"email_verified"`
+	Name     string `json:"name"`
 }
 
 func (f *ForwardAuth) GetUser(token string) (User, error) {

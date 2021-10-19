@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -18,6 +19,15 @@ import (
 var fw *ForwardAuth
 var log logrus.FieldLogger
 
+// Add CORs related headers
+func allowCors(w *http.ResponseWriter, allowedHeaders string) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+	if allowedHeaders != "" {
+		(*w).Header().Set("Access-Control-Allow-Headers", allowedHeaders)
+	}
+}
+
 // Primary handler
 func handler(w http.ResponseWriter, r *http.Request) {
 	// Logging setup
@@ -25,8 +35,22 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		"SourceIP": r.Header.Get("X-Forwarded-For"),
 	})
 	logger.WithFields(logrus.Fields{
+		"Method":  r.Method,
 		"Headers": r.Header,
 	}).Debugf("Handling request")
+
+	allowCors(&w, fw.tokenHeader)
+
+	// NOTE: This assumes the traffic is behind a Traefik instance which will
+	//  reroute OPTION requests as GETS causing redirect issues on the frontend.
+	//  Traefik will store the original method in the X-Forwarded-Method header.
+	//  This isn't secure and we should probably figure out how to prevent Traefik from doing this.
+	if r.Header.Get("X-Forwarded-Method") == "OPTIONS" {
+		logger.Debugf("Allowing valid Traefik routed requests that is doing a preflight options request")
+		w.Header().Set("X-Forwarded-User", "")
+		w.WriteHeader(200)
+		return
+	}
 
 	// Parse uri
 	uri, err := url.Parse(r.Header.Get("X-Forwarded-Uri"))
@@ -36,57 +60,91 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Handle callback
-	if uri.Path == fw.Path {
-		logger.Debugf("Passing request to auth callback")
-		handleCallback(w, r, uri.Query(), logger)
-		return
-	}
+	var forwardedUser = ""
+	logger.WithFields(logrus.Fields{
+		"field": fw.tokenHeader,
+		"value": r.Header.Get(fw.tokenHeader),
+	}).Debugf("Token information.")
 
-	// Get auth cookie
-	c, err := r.Cookie(fw.CookieName)
-	if err != nil {
-		// Error indicates no cookie, generate nonce
-		err, nonce := fw.Nonce()
-		if err != nil {
-			logger.Errorf("Error generating nonce, %v", err)
-			http.Error(w, "Service unavailable", 503)
+	// Handle callback if no token header is set or found.
+	if fw.tokenHeader == "" || r.Header.Get(fw.tokenHeader) == "" {
+		if uri.Path == fw.Path {
+			logger.Debugf("Passing request to auth callback")
+			handleCallback(w, r, uri.Query(), logger)
 			return
 		}
 
-		// Set the CSRF cookie
-		http.SetCookie(w, fw.MakeCSRFCookie(r, nonce))
-		logger.Debug("Set CSRF cookie and redirecting to oidc login")
-		logger.Debug("uri.Path was %s",uri.Path)
-		logger.Debug("fw.Path was %s",fw.Path)
+		// Get auth cookie
+		c, err := r.Cookie(fw.CookieName)
+		if err != nil {
+			logger.Debugf("Received error, %v", err)
+			// Error indicates no cookie, generate nonce
+			err, nonce := fw.Nonce()
+			if err != nil {
+				logger.Errorf("Error generating nonce, %v", err)
+				http.Error(w, "Service unavailable", 503)
+				return
+			}
 
-		// Forward them on
-		http.Redirect(w, r, fw.GetLoginURL(r, nonce), http.StatusTemporaryRedirect)
+			// Set the CSRF cookie
+			http.SetCookie(w, fw.MakeCSRFCookie(r, nonce))
+			logger.Debug("Set CSRF cookie and redirecting to oidc login")
+			logger.Debug("uri.Path was %s", uri.Path)
+			logger.Debug("fw.Path was %s", fw.Path)
 
-		return
-	}
+			// Forward them on
+			http.Redirect(w, r, fw.GetLoginURL(r, nonce), http.StatusTemporaryRedirect)
 
-	// Validate cookie
-	valid, email, err := fw.ValidateCookie(r, c)
-	if !valid {
-		logger.Errorf("Invalid cookie: %v", err)
-		http.Error(w, "Not authorized", 401)
-		return
-	}
+			return
+		}
 
-	// Validate user
-	valid = fw.ValidateEmail(email)
-	if !valid {
+		// Validate cookie
+		valid, email, err := fw.ValidateCookie(r, c)
+		if !valid {
+			logger.Errorf("Invalid cookie: %v", err)
+			http.Error(w, "Not authorized", 401)
+			return
+		}
+
+		// Validate user
+		valid = fw.ValidateEmail(email)
+		if !valid {
+			logger.WithFields(logrus.Fields{
+				"email": email,
+			}).Errorf("Invalid email")
+			http.Error(w, "Not authorized", 401)
+			return
+		}
+
+		forwardedUser = email
+	} else {
+		var token = r.Header.Get(fw.tokenHeader)
+		var bearer = "Bearer " + token
+
+		logger.Debugf("Found field with token. Will verify token.", token)
+		req, err := http.NewRequest(http.MethodGet, fw.UserURL.String(), nil)
+		req.Header.Add("Authorization", bearer)
+		client := &http.Client{}
+		// Make a call to the OIDC provider with the token to verify access
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.WithFields(logrus.Fields{
+				"token": token,
+			}).Errorf("Invalid token provided")
+			http.Error(w, "Not authorized", 401)
+			return
+		}
+
+		body, _ := ioutil.ReadAll(resp.Body)
 		logger.WithFields(logrus.Fields{
-			"email": email,
-		}).Errorf("Invalid email")
-		http.Error(w, "Not authorized", 401)
-		return
+			"user": string(body),
+		}).Info("Successfully verified user.")
+		forwardedUser = token
 	}
 
 	// Valid request
 	logger.Debugf("Allowing valid request ")
-	w.Header().Set("X-Forwarded-User", email)
+	w.Header().Set("X-Forwarded-User", forwardedUser)
 	w.WriteHeader(200)
 }
 
@@ -146,8 +204,14 @@ func getOidcConfig(oidc string) map[string]interface{} {
 	if err != nil {
 		log.Fatal("failed to parse oidc string")
 	}
+
+
+	log.Info("in get OIDC config")
+	log.Info(uri)
+
 	uri.Path = path.Join(uri.Path, "/.well-known/openid-configuration")
 	res, err := http.Get(uri.String())
+
 	if err != nil {
 		log.Fatal("failed to get oidc parametere from oidc connect")
 	}
@@ -182,11 +246,18 @@ func main() {
 	prompt := flag.String("prompt", "", "Space separated list of OpenID prompt options")
 	logLevel := flag.String("log-level", "warn", "Log level: trace, debug, info, warn, error, fatal, panic")
 	logFormat := flag.String("log-format", "text", "Log format: text, json, pretty")
-
+	insecure := flag.Bool("insecure", false, "Disable verifying SSL certificates")
+	tokenHeader := flag.String("token-header", "", "An optional header that holds a token as an alternative form of authentication.")
 	flag.Parse()
 
 	// Setup logger
 	log = CreateLogger(*logLevel, *logFormat)
+
+	// If insecure then skip verifying certs
+	if *insecure {
+		log.Info("Disabling SSL certificate verification.")
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
 
 	// Backwards compatibility
 	if *secret == "" && *cookieSecret != "" {
@@ -256,6 +327,8 @@ func main() {
 		Whitelist: whitelist,
 
 		Prompt: *prompt,
+
+		tokenHeader: *tokenHeader,
 	}
 
 	// Attach handler

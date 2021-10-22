@@ -213,6 +213,7 @@ func getOidcConfig(oidc string) map[string]interface{} {
 	res, err := http.Get(uri.String())
 
 	if err != nil {
+		fmt.Println(err)
 		log.Fatal("failed to get oidc parametere from oidc connect")
 	}
 	body, err := ioutil.ReadAll(res.Body)
